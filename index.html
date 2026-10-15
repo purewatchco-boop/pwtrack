@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>PureWatch Трекер</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{
+  --bg:var(--tg-theme-bg-color,#111318);
+  --text:var(--tg-theme-text-color,#f2f2ee);
+  --hint:var(--tg-theme-hint-color,#8b8f98);
+  --card:var(--tg-theme-secondary-bg-color,#1b1e25);
+  --btn:var(--tg-theme-button-color,#e8a03a);
+  --btntext:var(--tg-theme-button-text-color,#111);
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px);
+  padding-bottom:env(safe-area-inset-bottom,0px);
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+nav{position:sticky;top:0;z-index:5;display:flex;gap:6px;padding:10px;background:var(--bg)}
+nav button{flex:1;padding:9px 4px;border:0;border-radius:10px;background:var(--card);color:var(--hint);font-size:13px}
+nav button.on{background:var(--btn);color:var(--btntext);font-weight:600}
+main{padding:0 10px 30px}
+input,textarea{width:100%;padding:11px 12px;border:0;border-radius:10px;background:var(--card);color:var(--text);font:inherit}
+textarea{min-height:80px;resize:vertical}
+.row{display:flex;gap:10px;padding:10px;margin-top:8px;background:var(--card);border-radius:12px}
+.row img,.ph{width:56px;height:84px;border-radius:8px;object-fit:cover;background:#2a2d35;flex:none}
+.info{flex:1;min-width:0}
+.title{font-weight:600}
+.sub{color:var(--hint);font-size:13px}
+.acts{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+.b{padding:7px 12px;border:0;border-radius:8px;background:var(--btn);color:var(--btntext);font-size:13px}
+.b.alt{background:#2a2d35;color:var(--text)}
+.b.red{background:#7a2a2a;color:#fff}
+.badge{display:inline-block;padding:2px 8px;border-radius:8px;background:var(--btn);color:var(--btntext);font-size:12px;font-weight:600}
+.empty{text-align:center;color:var(--hint);padding:40px 10px}
+#modal{position:fixed;inset:0;z-index:10;background:rgba(0,0,0,.6);display:flex;align-items:flex-end}
+#modal[hidden]{display:none}
+.sheet{width:100%;max-height:92%;overflow:auto;background:var(--bg);border-radius:18px 18px 0 0;padding:16px;padding-bottom:calc(16px + env(safe-area-inset-bottom,0px))}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 12px}
+.chip{min-width:36px;padding:7px 10px;border:0;border-radius:8px;background:var(--card);color:var(--text);font-size:13px}
+.chip.on{background:var(--btn);color:var(--btntext);font-weight:600}
+h3{margin:14px 0 4px;font-size:14px;color:var(--hint);font-weight:500}
+.stat{display:flex;gap:8px;margin-top:8px}
+.stat div{flex:1;padding:12px;background:var(--card);border-radius:12px;text-align:center}
+.stat b{display:block;font-size:22px}
+.bar{height:8px;border-radius:4px;background:var(--btn);margin-top:4px}
+</style>
+</head>
+<body>
+<nav id="nav">
+  <button data-t="search" class="on">Поиск</button>
+  <button data-t="want">Хочу</button>
+  <button data-t="done">Смотрел</button>
+  <button data-t="stats">Итоги</button>
+</nav>
+<main id="view"></main>
+<div id="modal" hidden><div class="sheet" id="sheet"></div></div>
+
+<script>
+// ВСТАВЬТЕ адрес вашего воркера Cloudflare (без слэша в конце)
+const API = "https://muddy-cherry-93ac.purewatchco.workers.dev";
+const IMG = "https://image.tmdb.org/t/p/w185";
+
+const tg = window.Telegram && Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+const inTg = !!(tg && tg.initData && tg.CloudStorage);
+
+const store = inTg ? {
+  getAll() {
+    return new Promise(res => {
+      tg.CloudStorage.getKeys((e, keys) => {
+        if (e || !keys || !keys.length) return res({});
+        tg.CloudStorage.getItems(keys, (e2, vals) => res(e2 ? {} : vals));
+      });
+    });
+  },
+  set(k, v) { return new Promise(r => tg.CloudStorage.setItem(k, v, () => r())); },
+  del(k) { return new Promise(r => tg.CloudStorage.removeItem(k, () => r())); }
+} : {
+  async getAll() {
+    const o = {};
+    try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (/^[mt]\d+$/.test(k)) o[k] = localStorage.getItem(k); } } catch (e) {}
+    return o;
+  },
+  async set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+  async del(k) { try { localStorage.removeItem(k); } catch (e) {} }
+};
+
+let items = {};
+let tab = "search";
+let results = [];
+let query = "";
+let timer;
+
+const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const keyOf = (k, id) => (k === "movie" ? "m" : "t") + id;
+
+async function api(path, params) {
+  const r = await fetch(API + path + (params ? "?" + new URLSearchParams(params) : ""));
+  if (!r.ok) throw new Error("api " + r.status);
+  return r.json();
+}
+
+async function save(it) {
+  if (it.n && it.n.length > 600) it.n = it.n.slice(0, 600);
+  items[keyOf(it.k, it.i)] = it;
+  await store.set(keyOf(it.k, it.i), JSON.stringify(it));
+}
+
+async function remove(it) {
+  delete items[keyOf(it.k, it.i)];
+  await store.del(keyOf(it.k, it.i));
+}
+
+function poster(p) {
+  return p ? `<img src="${IMG}${esc(p)}" loading="lazy" alt="">` : `<div class="ph"></div>`;
+}
+
+function render() {
+  document.querySelectorAll("#nav button").forEach(b => b.classList.toggle("on", b.dataset.t === tab));
+  const v = document.getElementById("view");
+  if (tab === "search") return renderSearch(v);
+  if (tab === "stats") return renderStats(v);
+  renderList(v, tab);
+}
+
+function renderSearch(v) {
+  v.innerHTML = `<input id="q" placeholder="Название фильма или сериала" value="${esc(query)}"><div id="res"></div>`;
+  const q = document.getElementById("q");
+  q.addEventListener("input", () => {
+    query = q.value;
+    clearTimeout(timer);
+    timer = setTimeout(doSearch, 400);
+  });
+  drawResults();
+}
+
+async function doSearch() {
+  const res = document.getElementById("res");
+  if (!query.trim()) { results = []; return drawResults(); }
+  if (res) res.innerHTML = `<div class="empty">Ищу…</div>`;
+  try {
+    const d = await api("/search/multi", { query });
+    results = d.results.filter(x => x.media_type === "movie" || x.media_type === "tv").slice(0, 15);
+  } catch (e) {
+    results = [];
+    if (res) res.innerHTML = `<div class="empty">Не удалось загрузить. Проверьте адрес воркера.</div>`;
+    return;
+  }
+  drawResults();
+}
+
+function drawResults() {
+  const res = document.getElementById("res");
+  if (!res) return;
+  if (!results.length) { res.innerHTML = query.trim() ? `<div class="empty">Ничего не найдено</div>` : `<div class="empty">Найдите фильм или сериал и добавьте в список</div>`; return; }
+  res.innerHTML = results.map((r, i) => {
+    const k = r.media_type, title = r.title || r.name, y = (r.release_date || r.first_air_date || "").slice(0, 4);
+    const ex = items[keyOf(k, r.id)];
+    const status = ex ? `<span class="badge">${ex.s === "d" ? "Смотрел" : "Хочу"}</span>` : "";
+    const btns = ex ? `<button class="b alt" data-open="${i}">Открыть</button>` :
+      `<button class="b alt" data-add="w" data-i="${i}">Хочу</button><button class="b" data-add="d" data-i="${i}">Смотрел</button>`;
+    return `<div class="row">${poster(r.poster_path)}<div class="info"><div class="title">${esc(title)}</div>
+      <div class="sub">${k === "movie" ? "Фильм" : "Сериал"}${y ? " · " + y : ""}${r.vote_average ? " · ⭐ " + r.vote_average.toFixed(1) : ""} ${status}</div>
+      <div class="acts">${btns}</div></div></div>`;
+  }).join("");
+  res.querySelectorAll("[data-add]").forEach(b => b.onclick = () => addItem(results[+b.dataset.i], b.dataset.add, b));
+  res.querySelectorAll("[data-open]").forEach(b => b.onclick = () => {
+    const r = results[+b.dataset.open];
+    openModal(items[keyOf(r.media_type, r.id)]);
+  });
+}
+
+async function addItem(r, status, btn) {
+  btn.disabled = true; btn.textContent = "…";
+  const k = r.media_type;
+  let d = {};
+  try { d = await api(`/${k}/${r.id}`); } catch (e) {}
+  const it = {
+    i: r.id, k,
+    t: r.title || r.name,
+    y: (r.release_date || r.first_air_date || "").slice(0, 4),
+    p: r.poster_path || "",
+    g: (d.genres || []).map(g => g.name).slice(0, 3),
+    s: status, r: 0, n: "", ss: [],
+    ns: d.number_of_seasons || 0,
+    rt: d.runtime || 0,
+    d: Math.floor(Date.now() / 1000)
+  };
+  await save(it);
+  if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
+  drawResults();
+}
+
+function renderList(v, st) {
+  const list = Object.values(items).filter(x => x.s === (st === "done" ? "d" : "w")).sort((a, b) => b.d - a.d);
+  if (!list.length) { v.innerHTML = `<div class="empty">Здесь пока пусто.<br>Найдите фильм во вкладке «Поиск».</div>`; return; }
+  v.innerHTML = list.map(x => `<div class="row" data-k="${keyOf(x.k, x.i)}">${poster(x.p)}<div class="info">
+    <div class="title">${esc(x.t)}</div>
+    <div class="sub">${x.k === "movie" ? "Фильм" : "Сериал"}${x.y ? " · " + x.y : ""}${x.g.length ? " · " + esc(x.g.join(", ")) : ""}</div>
+    <div class="acts">${x.r ? `<span class="badge">⭐ ${x.r}/10</span>` : ""}${x.k === "tv" && x.ns ? `<span class="sub">сезонов: ${x.ss.length}/${x.ns}</span>` : ""}</div>
+  </div></div>`).join("");
+  v.querySelectorAll(".row").forEach(r => r.onclick = () => openModal(items[r.dataset.k]));
+}
+
+function renderStats(v) {
+  const done = Object.values(items).filter(x => x.s === "d");
+  const films = done.filter(x => x.k === "movie"), shows = done.filter(x => x.k === "tv");
+  const rated = done.filter(x => x.r);
+  const avg = rated.length ? (rated.reduce((a, x) => a + x.r, 0) / rated.length).toFixed(1) : "—";
+  const minutes = films.reduce((a, x) => a + (x.rt || 0), 0);
+  const hours = Math.round(minutes / 60);
+  const gc = {};
+  done.forEach(x => x.g.forEach(g => gc[g] = (gc[g] || 0) + 1));
+  const top = Object.entries(gc).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  const max = top.length ? top[0][1] : 1;
+  const want = Object.values(items).filter(x => x.s === "w").length;
+  v.innerHTML = `<div class="stat"><div><b>${films.length}</b><span class="sub">фильмов</span></div><div><b>${shows.length}</b><span class="sub">сериалов</span></div></div>
+  <div class="stat"><div><b>${avg}</b><span class="sub">средняя оценка</span></div><div><b>${hours}</b><span class="sub">часов фильмов</span></div></div>
+  <div class="stat"><div><b>${want}</b><span class="sub">в планах</span></div></div>
+  <h3>Любимые жанры</h3>${top.length ? top.map(([g, n]) => `<div class="row" style="display:block"><div>${esc(g)} <span class="sub">· ${n}</span></div><div class="bar" style="width:${Math.round(n / max * 100)}%"></div></div>`).join("") : `<div class="empty">Отметьте просмотренное, чтобы увидеть статистику</div>`}`;
+}
+
+function openModal(it) {
+  if (!it) return;
+  const m = document.getElementById("modal"), s = document.getElementById("sheet");
+  const draw = () => {
+    s.innerHTML = `<div class="row" style="margin-top:0">${poster(it.p)}<div class="info"><div class="title">${esc(it.t)}</div>
+      <div class="sub">${it.k === "movie" ? "Фильм" : "Сериал"}${it.y ? " · " + it.y : ""}</div>
+      <div class="acts"><button class="b ${it.s === "w" ? "" : "alt"}" data-s="w">Хочу</button><button class="b ${it.s === "d" ? "" : "alt"}" data-s="d">Смотрел</button></div></div></div>
+      <h3>Оценка</h3><div class="chips">${[1,2,3,4,5,6,7,8,9,10].map(n => `<button class="chip ${it.r === n ? "on" : ""}" data-r="${n}">${n}</button>`).join("")}</div>
+      ${it.k === "tv" && it.ns ? `<h3>Просмотренные сезоны</h3><div class="chips">${Array.from({ length: it.ns }, (_, i) => i + 1).map(n => `<button class="chip ${it.ss.includes(n) ? "on" : ""}" data-ss="${n}">${n}</button>`).join("")}</div>` : ""}
+      <h3>Заметка</h3><textarea id="note" maxlength="600" placeholder="Ваши впечатления">${esc(it.n)}</textarea>
+      <div class="acts" style="margin-top:12px"><button class="b" id="close">Готово</button><button class="b red" id="del">Удалить</button></div>`;
+    s.querySelectorAll("[data-s]").forEach(b => b.onclick = async () => { it.s = b.dataset.s; if (it.s === "d" && it.d) it.d = Math.floor(Date.now() / 1000); await save(it); draw(); });
+    s.querySelectorAll("[data-r]").forEach(b => b.onclick = async () => { const n = +b.dataset.r; it.r = it.r === n ? 0 : n; await save(it); draw(); });
+    s.querySelectorAll("[data-ss]").forEach(b => b.onclick = async () => {
+      const n = +b.dataset.ss;
+      it.ss = it.ss.includes(n) ? it.ss.filter(x => x !== n) : [...it.ss, n].sort((a, b) => a - b);
+      await save(it); draw();
+    });
+    s.querySelector("#close").onclick = closeModal;
+    s.querySelector("#del").onclick = () => {
+      const go = async () => { await remove(it); m.hidden = true; render(); };
+      if (tg && tg.showConfirm) tg.showConfirm("Удалить из списка?", ok => ok && go()); else if (confirm("Удалить из списка?")) go();
+    };
+  };
+  const closeModal = async () => {
+    const n = s.querySelector("#note");
+    if (n && n.value !== it.n) { it.n = n.value; await save(it); }
+    m.hidden = true; render();
+  };
+  m.onclick = e => { if (e.target === m) closeModal(); };
+  draw();
+  m.hidden = false;
+}
+
+document.querySelectorAll("#nav button").forEach(b => b.onclick = () => { tab = b.dataset.t; render(); });
+
+(async () => {
+  const raw = await store.getAll();
+  for (const [k, v] of Object.entries(raw)) {
+    try { const o = JSON.parse(v); if (o && o.i) items[k] = o; } catch (e) {}
+  }
+  render();
+})();
+</script>
+</body>
+</html>
